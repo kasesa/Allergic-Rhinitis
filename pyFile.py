@@ -1,5 +1,5 @@
-from statistics import mode
 from imutils import paths
+import imutils
 import os
 import cv2
 import numpy as np
@@ -12,12 +12,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.metrics import confusion_matrix
 
-from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
 from tensorflow.keras.applications import VGG16, VGG19, InceptionResNetV2, DenseNet121, ResNet50V2, ResNet101V2, Xception, InceptionV3
 from tensorflow.keras.layers import AveragePooling2D, Dropout, Flatten, Dense, Input
-from tensorflow.keras.models import Model, model_from_json
+from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
+
+from ImageCorrection import colorCorrect
+
 
 class ARModel:
     def __init__(self):
@@ -27,7 +29,33 @@ class ARModel:
         self.labels = []
         self.meta = {}
 
-    def loadImages(self, path=r'C:\Users\cvpr\Documents\Bishal\Allergic Rhinitis\Dataset\rotate', plotType="all"):
+    def cropImage(self, img):
+        grayscale = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        _,thresholded = cv2.threshold(grayscale, 0, 255, cv2.THRESH_OTSU)
+        #cv2.imwrite("otsu.png", thresholded)
+        bbox = cv2.boundingRect(thresholded)
+        x, y, w, h = bbox
+        #print(bbox)
+        croppedImg = img[y:y+h, x:x+w]
+        return croppedImg
+
+    def addContours(self, image):
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (7,7), 0)
+
+        edged = cv2.Canny(blur, 10, 100)
+        edged = cv2.dilate(edged, None, iterations=1)
+        edged = cv2.erode(edged, None, iterations=1)
+        
+        cnts = cv2.findContours(edged.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cnts = imutils.grab_contours(cnts)
+    
+        #(cnts, _) = imutils.contours.sort_contours(cnts)
+        cv2.drawContours(image, cnts, -1, (0,255,0), 1)
+        return image
+
+    def loadImages(self, path=r'C:\Users\cvpr\Documents\Bishal\Allergic Rhinitis\Dataset\rotate', plotType="all", crop = False, correctColor=False, 
+                    contours=False, printImgDemo=False):
         print("[INFO]: Trying to Read the images from ", path)
         #  Configure the Image Location
         # 이미지 위치 구성하기
@@ -35,6 +63,9 @@ class ARModel:
         # Plot type is used only in title of plot image
         # Adding to metadata
         self.meta["dataInfo"] = plotType
+
+        singleImagePrintLabel = []
+        
         
         # Formatting data and labels
         for imagePath in imagePaths:
@@ -42,11 +73,30 @@ class ARModel:
             # 파일 이름에서 클래스 레이블을 추출하고 레이블에 추가함
             label = imagePath.split(os.path.sep)[-2]
             self.labels.append(label)
+            
             # Load the image, swap color channels, and resize it to be a fixed 224x224 pixels while ignoring the aspect ratio
             # 이미지를 로드하고, 컬러 채널을 스왑하고, 가로 세로 비율을 무시하고 고정 224x224 픽셀로 크기를 조정함
             image = cv2.imread(imagePath)
             image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if crop:
+                image = self.cropImage(image)
             image = cv2.resize(image, (224,224))
+
+            # If Color Correction is required
+            # Perform Color Correction
+            if correctColor:
+                image = colorCorrect(image)
+
+            # Contours is added in image if required
+            if contours:
+                image = self.addContours(image)
+        
+            # Setting code to print image - one from each class
+            if label not in singleImagePrintLabel:
+                singleImagePrintLabel.append(label)
+                if printImgDemo:
+                    self.savePlot(image, label)
+
             # Append to data
             # 데이터에 추가
             self.data.append(image)
@@ -238,6 +288,12 @@ class ARModel:
         plt.ylabel("Loss/Accuracy")
         plt.legend(loc="lower left")
         figName = "[iter-"+str(iter)+"]plot-" + datetime.now().strftime('%H-%M-%S')
+        plt.savefig(figName)
+
+    def savePlot(self, image, text = ""):
+        plt.figure()
+        plt.imshow(image)
+        figName = "[custom]plot-" + text +"-"+datetime.now().strftime('%H-%M-%S')
         plt.savefig(figName)
 
     def crossValidate(self, path = r'C:\Users\cvpr\Documents\Bishal\Allergic Rhinitis\Dataset', modelType="inception", 
