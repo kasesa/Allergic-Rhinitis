@@ -1,3 +1,4 @@
+from turtle import colormode
 from imutils import paths
 import imutils
 import os
@@ -6,8 +7,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import timeit
 from datetime import datetime
+from random import shuffle
 
 from sklearn.preprocessing import LabelBinarizer
+from tensorflow.keras.utils import to_categorical
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.metrics import confusion_matrix
@@ -17,8 +20,12 @@ from tensorflow.keras.applications import VGG16, VGG19, InceptionResNetV2, Dense
 from tensorflow.keras.layers import AveragePooling2D, Dropout, Flatten, Dense, Input
 from tensorflow.keras.models import Model
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras import losses
+
+import tensorflow_addons as tfa
 
 from ImageCorrection import colorCorrect
+from gradCam2 import  getHeatMap, saveGradCam
 
 
 class ARModel:
@@ -54,30 +61,50 @@ class ARModel:
         cv2.drawContours(image, cnts, -1, (0,255,0), 1)
         return image
 
-    def loadImages(self, path=r'C:\Users\cvpr\Documents\Bishal\Allergic Rhinitis\Dataset\rotate', plotType="all", crop = False, correctColor=False, 
-                    contours=False, printImgDemo=False):
+    def loadImages(self, path=r'C:\Users\cvpr\Documents\Bishal\Allergic Rhinitis\Dataset\rotate', plotType="all", classification="multiclass", colorMode = "RGB",
+                    crop = False, correctColor=False, contours=False, printImgDemo=False):
         print("[INFO]: Trying to Read the images from ", path)
-        #  Configure the Image Location
+        #  Configure the Image Location            
         # 이미지 위치 구성하기
-        imagePaths = list(paths.list_images(path))
+        self.imagePaths = list(paths.list_images(path))
         # Plot type is used only in title of plot image
         # Adding to metadata
         self.meta["dataInfo"] = plotType
+        self.meta["classification"] = classification
 
         singleImagePrintLabel = []
+
+        # Save meta information for future img manipulation
+
+
+        # Shuffle the items in the image data paths
+        #shuffle(self.imagePaths)
         
         
         # Formatting data and labels
-        for imagePath in imagePaths:
+        for imagePath in self.imagePaths:
             # Extract the class label from file name and append to labels
             # 파일 이름에서 클래스 레이블을 추출하고 레이블에 추가함
             label = imagePath.split(os.path.sep)[-2]
-            self.labels.append(label)
+
+            # dividing labels based on multiclass or binary
+            if classification=="binary":
+                if label=="2":
+                    self.labels.append("1")
+                else:
+                    self.labels.append(label)
+            else:
+                self.labels.append(label)
             
             # Load the image, swap color channels, and resize it to be a fixed 224x224 pixels while ignoring the aspect ratio
             # 이미지를 로드하고, 컬러 채널을 스왑하고, 가로 세로 비율을 무시하고 고정 224x224 픽셀로 크기를 조정함
-            image = cv2.imread(imagePath)
-            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            if colorMode=="LAB":
+                image = cv2.imread(imagePath)
+                image = image.astype("float32")
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2Lab)
+            else:
+                image = cv2.imread(imagePath)
+                image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
             if crop:
                 image = self.cropImage(image)
             image = cv2.resize(image, (224,224))
@@ -111,6 +138,10 @@ class ARModel:
 
         print("[INFO]: Preparing Data")
 
+        # 
+        # self.data = np.array(self.data) / 255.0
+        # Zero Mean Normalization 
+        # self.data = (self.data - self.data.mean()) / self.data.var()
         self.data = np.array(self.data) / 255.0
         self.labels = np.array(self.labels)
 
@@ -119,11 +150,21 @@ class ARModel:
         self.lb = LabelBinarizer()
         self.labels = self.lb.fit_transform(self.labels)
 
-    def setDataAugmentation(self, rotation=30, zoom=0.15, wShift=0.2, hShift=0.2, shear=0.15, hFlip=True):
+        # Categorize data if classification mode is binary
+        if self.meta["classification"]=="binary":
+            self.labels = to_categorical(self.labels)
+
+    def setDataAugmentation(self, normalizeData=False, rotation=30, zoom=[0.5, 1.0], wShift=0.2, hShift=0.2, shear=0.15, hFlip=True, vFlip=False):
         # Initialize the training data augmentation
         # 교육 데이터 억멘테이션 초기화
-        self.trainAug = ImageDataGenerator(rotation_range=rotation, zoom_range=zoom, width_shift_range=wShift, height_shift_range=hShift,
-		shear_range=shear, fill_mode="nearest", horizontal_flip=hFlip)
+
+        # the brightness augmentation was removed as it lead to poor training.
+        if normalizeData:
+             self.trainAug = ImageDataGenerator(featurewise_center=True, featurewise_std_normalization=True, rotation_range=rotation, zoom_range=zoom, width_shift_range=wShift, height_shift_range=hShift,
+		                     shear_range=shear, fill_mode="nearest", horizontal_flip=hFlip, vertical_flip=vFlip)
+        else:
+            self.trainAug = ImageDataGenerator(rotation_range=rotation, zoom_range=zoom, width_shift_range=wShift, height_shift_range=hShift,
+		                     shear_range=shear, fill_mode="nearest", horizontal_flip=hFlip, vertical_flip=vFlip)
          # Adding to metadata
         self.meta["dataAugmentation"] = {}
         self.meta["dataAugmentation"]["rotation"] = rotation
@@ -132,6 +173,7 @@ class ARModel:
         self.meta["dataAugmentation"]["hShift"] = hShift
         self.meta["dataAugmentation"]["shear"] = shear
         self.meta["dataAugmentation"]["hFlip"] = hFlip
+        self.meta["dataAugmentation"]["vFlip"] = vFlip
 
         print("[INFO]: Augmenting Data with - ")
         print(self.meta["dataAugmentation"])
@@ -187,7 +229,11 @@ class ARModel:
         self.headModel = Flatten(name="flatten")(self.headModel)
         self.headModel = Dense(64, activation="relu")(self.headModel)
         self.headModel = Dropout(dropoutRate)(self.headModel)
-        self.headModel = Dense(3, activation="softmax")(self.headModel)
+        # Head Model Configuration based on classfication type
+        if self.meta["classification"]=="binary":
+            self.headModel = Dense(2, activation="softmax")(self.headModel) 
+        else:  
+            self.headModel = Dense(3, activation="softmax")(self.headModel)
         # Adding to metadata
         self.meta["dropoutRate"] = dropoutRate
     
@@ -219,9 +265,22 @@ class ARModel:
     def compileModel(self, loss="binary_crossentropy"):
         # Compile the Model
         # 모델 컴파일
-        opt = Adam(learning_rate=self.INIT_LR, decay=self.INIT_LR / self.EPOCHS)
-        self.model.compile(loss=loss, optimizer=opt, metrics=["accuracy"])
         print("[INFO]: Compiling Model")
+        opt = Adam(learning_rate=self.INIT_LR, decay=self.INIT_LR / self.EPOCHS)
+
+        if loss=="cce":
+            self.model.compile(loss=losses.CategoricalCrossentropy(), optimizer=opt, metrics=["accuracy"])
+        elif loss=="bce":
+            self.model.compile(loss="binary_crossentropy", optimizer=opt, metrics=["accuracy"])
+        elif loss=="focal":
+            self.model.compile(loss=tfa.losses.SigmoidFocalCrossEntropy(), optimizer=opt, metrics=["accuracy"])
+        elif loss=="scce":
+            self.model.compile(loss="sparse_categorical_crossentropy", optimizer=opt, metrics=["accuracy"])
+        elif loss=="kld":
+            self.model.compile(loss="kullback_leibler_divergence", optimizer=opt, metrics=["accuracy"])
+        else:
+            print(loss+" not available. Proceeding with binary_crossentropy")
+            self.model.compile(loss="binary_crossentropy", optimizer=opt, metrics=["accuracy"])   
 
     def startTraining(self):                                                        
         # Train the Network Model
@@ -256,10 +315,18 @@ class ARModel:
         # 혼란 매트릭스
         cm= confusion_matrix(self.testY.argmax(axis=1), self.predIdxs)
         total = sum(sum(cm))
-        acc = (cm[0,0] + cm[1,1] + cm[2,2]) / total
+        if self.meta["classification"]=="binary":
+            acc = (cm[0,0] + cm[1,1]) / total
+            sensitivity = cm[0, 0] / (cm[0, 0] + cm[0, 1])
+            specificity = cm[1, 1] / (cm[1, 0] + cm[1, 1])
+            
+        else:
+            acc = (cm[0,0] + cm[1,1] + cm[2,2]) / total
+            sensitivity = cm[0, 0] / (cm[0, 0] + cm[0, 1] + cm[0,2])
+            specificity = cm[1, 1] / (cm[1, 0] + cm[1, 1] + cm[1,2])
+            specificity2 = cm[2, 2] / (cm[2, 0] + cm[2, 1] + cm[2,2])
+            specificity = (specificity + specificity2) / 2
 
-        sensitivity = cm[0, 0] / (cm[0, 0] + cm[0, 1])
-        specificity = cm[1, 1] / (cm[1, 0] + cm[1, 1])
         # show the confusion matrix, accuracy, sensitivity, and specificity
         # 혼란 매트릭스 보기
         print("Confusion Matrix and its Derrivatives")
@@ -270,7 +337,7 @@ class ARModel:
         # Adding to metadata
         self.meta["accuracy"] = int(acc*100)
 
-    def generatePlot(self, iter=1):
+    def generatePlot(self, iterInfo=1):
         # plot the training loss and accuracy
         # 플롯 그래프
         print("[INFO]: Plot Generation")
@@ -287,7 +354,7 @@ class ARModel:
         plt.xlabel("Epoch #")
         plt.ylabel("Loss/Accuracy")
         plt.legend(loc="lower left")
-        figName = "[iter-"+str(iter)+"]plot-" + datetime.now().strftime('%H-%M-%S')
+        figName = "[iter-"+str(iterInfo)+"]plot-" + datetime.now().strftime('%H-%M-%S')
         plt.savefig(figName)
 
     def savePlot(self, image, text = ""):
@@ -295,6 +362,29 @@ class ARModel:
         plt.imshow(image)
         figName = "[custom]plot-" + text +"-"+datetime.now().strftime('%H-%M-%S')
         plt.savefig(figName)
+
+    def getGradCams(self, type, alpha=0.4):
+
+        # Set the last convolution layer
+        lastConvLayer = "block14_sepconv2_act"
+
+        # For all images in the dataset
+        if type=="all":
+            for img in self.imagePaths:
+                # get heatmmap
+                heat = getHeatMap(image=img, model=self.model, lastConvLayer=lastConvLayer, imageType="path")
+                #save gradcam
+                saveGradCam(image = img, heatmap = heat, alpha=alpha, imageType="path")
+
+        if type=="test":
+            for i in range(0, len(self.testX)):
+                testImage = self.testX[i]
+                testImage = np.expand_dims(testImage, axis=0)
+                # Rescale image to a range 0-255
+                testImage = np.uint(255 * testImage)
+                outString = "gradCam-"+str(i)+".jpg"
+                heat = getHeatMap(image=testImage, model=self.model, lastConvLayer=lastConvLayer, imageType="image")
+                saveGradCam(image=testImage[0], heatmap = heat, outPath=outString, alpha=alpha, imageType="image")
 
     def crossValidate(self, path = r'C:\Users\cvpr\Documents\Bishal\Allergic Rhinitis\Dataset', modelType="inception", 
                     dropoutRate=0.5, batchSize=8, epochs=100, learningRate=1e-3, iter=2, dataType="all"):
@@ -425,9 +515,10 @@ class ARModel:
             cm= confusion_matrix(testLabels.argmax(axis=1), predIdxs)
             total = sum(sum(cm))
             acc = (cm[0,0] + cm[1,1] + cm[2,2]) / total
-
-            sensitivity = cm[0, 0] / (cm[0, 0] + cm[0, 1])
-            specificity = cm[1, 1] / (cm[1, 0] + cm[1, 1])
+            sensitivity = cm[0, 0] / (cm[0, 0] + cm[0, 1] + cm[0,2])
+            specificity = cm[1, 1] / (cm[1, 0] + cm[1, 1] + cm[1,2])
+            specificity2 = cm[2, 2] / (cm[2, 0] + cm[2, 1] + cm[2,2])
+            specificity = (specificity + specificity2) / 2
 
             print("Confusion Matrix and its Derrivatives")
             print(cm)
