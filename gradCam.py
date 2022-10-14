@@ -89,3 +89,6 @@ class GradCAM:
 		# return a 2-tuple of the color mapped heatmap and the output,
 		# overlaid image
         return (heatmap, output)
+
+
+//Chimuco comment to hacktober 2
